@@ -125,6 +125,12 @@ HELP_MSG = """
     GitHub: https://github.com/ultralytics/ultralytics
     """
 
+# Matches a YAML line whose value is a YAML-special token that must be quoted.
+# Group 1 = key/list prefix (e.g. "  5: " or "  - "), Group 2 = bare special value.
+_RE_YAML_SPECIAL_VAL = re.compile(
+    r"^(\s*(?:\S+:\s+|-\s+))([?*&:!@`~|>%#].*|null|true|false|yes|no|on|off)\s*$",
+    re.IGNORECASE,
+)
 # Settings and Environment Variables
 torch.set_printoptions(linewidth=320, precision=4, profile="default")
 np.set_printoptions(linewidth=320, formatter=dict(float_kind="{:11.5g}".format))  # format short g, %precision=5
@@ -598,6 +604,33 @@ class YAML:
                 f.write(header)
             instance.yaml.dump(data, f, sort_keys=False, allow_unicode=True, Dumper=instance.SafeDumper)
 
+    @staticmethod
+    def _sanitize_yaml_names(raw: str) -> str:
+        """Quote YAML-special bare values inside the 'names:' block to prevent parse errors.
+
+        Handles class-name maps whose values are YAML reserved tokens (e.g. ``:``, ``?``,
+        ``!``, ``true``, ``null`` …).  Only lines inside the ``names:`` mapping are
+        rewritten; the rest of the document is left untouched.
+
+        Args:
+            raw (str): Raw YAML text.
+
+        Returns:
+            (str): YAML text with problematic name values single-quoted.
+        """
+        out, in_names, base = [], False, -1
+        for line in raw.split("\n"):
+            stripped = line.lstrip()
+            if stripped.startswith("names:"):
+                in_names, base = True, len(line) - len(stripped)
+            elif in_names and stripped and len(line) - len(stripped) <= base:
+                in_names = False
+            if in_names and (m := _RE_YAML_SPECIAL_VAL.match(line)):
+                # Single-quote the value; escape any embedded single quotes by doubling them
+                line = f"{m[1]}'{m[2].replace(chr(39), chr(39) * 2)}'"
+            out.append(line)
+        return "\n".join(out)
+
     @classmethod
     def load(cls, file="data.yaml", append_filename=False):
         """Load YAML file to Python object with robust error handling.
@@ -616,13 +649,17 @@ class YAML:
         with open(file, errors="ignore", encoding="utf-8") as f:
             s = f.read()
 
-        # Try loading YAML with fallback for problematic characters
+        # Try loading YAML; fall back through progressively more aggressive sanitization
         try:
             data = instance.yaml.load(s, Loader=instance.SafeLoader) or {}
         except Exception:
-            # Remove problematic characters and retry
-            s = re.sub(r"[^\x09\x0A\x0D\x20-\x7E\x85\xA0-\uD7FF\uE000-\uFFFD\U00010000-\U0010ffff]+", "", s)
-            data = instance.yaml.load(s, Loader=instance.SafeLoader) or {}
+            try:
+                # Quote YAML-special values in the names: block and retry
+                data = instance.yaml.load(cls._sanitize_yaml_names(s), Loader=instance.SafeLoader) or {}
+            except Exception:
+                # Strip non-printable / non-XML characters and retry
+                s = re.sub(r"[^\x09\x0A\x0D\x20-\x7E\x85\xA0-\uD7FF\uE000-\uFFFD\U00010000-\U0010ffff]+", "", s)
+                data = instance.yaml.load(s, Loader=instance.SafeLoader) or {}
 
         # Check for accidental user-error None strings (should be 'null' in YAML)
         if "None" in data.values():
